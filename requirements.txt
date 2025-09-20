@@ -1,0 +1,8 @@
+spacy
+pdfplumber
+python-docx
+openpyxl
+pyinstaller
+pillow
+pytesseract
+pdf2image
