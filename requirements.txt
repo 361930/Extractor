@@ -6,3 +6,4 @@ pyinstaller
 pillow
 pytesseract
 pdf2image
+customtkinter
