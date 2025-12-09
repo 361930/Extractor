@@ -2,10 +2,7 @@ import os
 import json
 import traceback
 import sys
-import spacy
-
-
-
+import requests # New import
 
 CONFIG_FILE = "config.json"
 LOG_DIR = "logs"
@@ -13,25 +10,30 @@ LOG_FILE = os.path.join(LOG_DIR, "errors.log")
 
 DEFAULT_CONFIG = {
     "active_excel": "resumes_data.xlsx",
-    "duplicate_check_enabled": True,
-    "duplicate_days": 30,
-    "last_used_model": "en_core_web_sm"
+    "duplicate_check_enabled": True
 }
 
 def ensure_dirs():
     os.makedirs(LOG_DIR, exist_ok=True)
 
 def log_error(msg: str):
+    """Logs an error message to the log file."""
     ensure_dirs()
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(msg + "\n" + ("-"*80) + "\n")
-
-
-
-
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            # FIX: The old line was too complex.
+            # The 'msg' variable already contains the full traceback.
+            f.write(f"{msg}\n{'-'*80}\n")
+    except Exception as e:
+        # If logging fails, print to console as a fallback
+        print("--- FATAL LOGGING ERROR ---")
+        print(f"Failed to write to log file: {e}")
+        print(f"Original message: {msg}")
+        print("--- END ---")
 
 # Config helpers
 def load_config():
+    """Loads config.json, creating it with defaults if it doesn't exist."""
     if not os.path.exists(CONFIG_FILE):
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
@@ -44,6 +46,7 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 def save_config(config: dict):
+    """Saves the config dictionary to config.json."""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -51,35 +54,45 @@ def save_config(config: dict):
         log_error("Failed to save config: " + str(e) + "\n" + traceback.format_exc())
 
 
-
-# NLP loader (tries transformer model first, falls back)
-import spacy
-
-
-
-def load_nlp_prefer_transformer(preferred_names=("en_core_web_trf", "en_core_web_sm")):
+# --- NEW: Ollama Connection Checker ---
+def check_ollama_connection():
     """
-    Try to load spaCy model folder from preferred_names in app dir (or _MEIPASS when frozen).
-    Returns (nlp, model_name) or raises OSError if none found.
+    Checks if the Ollama server is running and has the llama3:8b model.
+    Returns (True, "model_name") or (False, "error_message").
     """
-    base_search_paths = [os.getcwd()]
-    if getattr(sys, "frozen", False):
-        base_search_paths.insert(0, getattr(sys, "_MEIPASS", os.getcwd()))
+    OLLAMA_API_URL = "http://localhost:11434/api/tags"
+    MODEL_TO_CHECK = "llama3:8b"
+    
+    try:
+        print("Checking connection to Ollama server at http://localhost:11434...")
+        
+        # 1. Check if server is running
+        response = requests.get(OLLAMA_API_URL, timeout=5)
+        response.raise_for_status() # Raise error if status is 4xx or 5xx
+        
+        print("Ollama server is running.")
+        
+        # 2. Check if the model is downloaded
+        models_data = response.json()
+        available_models = [model['name'] for model in models_data.get('models', [])]
+        
+        if MODEL_TO_CHECK in available_models:
+            print(f"Found model: {MODEL_TO_CHECK}")
+            return True, MODEL_TO_CHECK
+        else:
+            error_msg = f"Ollama is running, but model '{MODEL_TO_CHECK}' is missing."
+            print(error_msg)
+            print("Please run this command in your terminal:")
+            print(f"ollama pull {MODEL_TO_CHECK}")
+            return False, error_msg
 
-    for model_name in preferred_names:
-        for base in base_search_paths:
-            candidate = os.path.join(base, model_name)
-            if os.path.isdir(candidate):
-                # attempt to load by path
-                try:
-                    nlp = spacy.load(candidate)
-                    return nlp, model_name
-                except Exception:
-                    # try by model name (package)
-                    try:
-                        nlp = spacy.load(model_name)
-                        return nlp, model_name
-                    except Exception:
-                        continue
-    # if we reach here, none could be loaded
-    raise OSError("No spaCy model found in app directory. Place model folder 'en_core_web_sm' or 'en_core_web_trf' next to the EXE.")
+    except requests.exceptions.ConnectionError:
+        error_msg = "Could not connect to Ollama."
+        print(error_msg)
+        print("Please make sure the Ollama application is running.")
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"An error occurred: {e}"
+        print(error_msg)
+        log_error(f"Ollama check failed: {e}\n{traceback.format_exc()}")
+        return False, error_msg
