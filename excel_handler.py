@@ -1,343 +1,296 @@
 # excel_handler.py
 import os
 from openpyxl import Workbook, load_workbook
-from datetime import date, datetime
-from utils import log_error
+from openpyxl.utils.exceptions import InvalidFileException
+# --- NEW: Imports for Excel Data Validation ---
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils import get_column_letter
+# --- END NEW ---
 from shutil import copy2
+from utils import log_error
+import zipfile # Added for error handling
 
-# Define the standard columns. This is the single source of truth.
-DEFAULT_COLS = ["S.No.", "Name", "Email", "Phone", "OriginalFile", "DateApplied", "ResumePath"]
-# Column indices for quick lookup (0-based)
-EMAIL_COL_IDX = 2
-DATE_COL_IDX = 5
+# Define the standard columns
+DEFAULT_COLS = ["S.No.", "Name", "Email", "Phone", "Status"]
+
+# --- NEW: Reusable function to add dropdowns ---
+def _apply_dropdown_validation(ws):
+    """Applies data validation dropdowns to the 'Status' column of a worksheet."""
+    try:
+        # Define the dropdown options (must match app.py)
+        STATUS_OPTIONS = [
+            "", "Accepted", "Rejected", "On Hold", 
+            "Interview Scheduled", "Pending Review"
+        ]
+        
+        # Create the data validation rule
+        dv = DataValidation(type="list", formula1=f'"{",".join(STATUS_OPTIONS)}"', allow_blank=True)
+        dv.error = "Your entry is not in the list."
+        dv.errorTitle = "Invalid Entry"
+        dv.prompt = "Please select from the list."
+        dv.promptTitle = "Select Status"
+        
+        # Add it to the worksheet
+        ws.add_data_validation(dv)
+        
+        # Find the column letter for "Status"
+        status_col_index = -1
+        for i, cell in enumerate(ws[1]): # Iterate over header row
+            if cell.value == "Status":
+                status_col_index = i + 1
+                break
+        
+        if status_col_index == -1:
+            print("Could not find 'Status' column to apply dropdowns.")
+            return
+
+        status_col_letter = get_column_letter(status_col_index)
+        
+        # Apply the rule to the entire "Status" column (skipping header)
+        dv.add(f'{status_col_letter}2:{status_col_letter}1048576')
+        print(f"Applied status dropdowns to worksheet.")
+        
+    except Exception as e:
+        log_error(f"Failed to add data validation to Excel: {e}")
+# --- END NEW ---
 
 
-def ensure_excel(path: str, columns=None):
-    """Creates an Excel file with standard columns if it doesn't exist."""
-    if os.path.exists(path):
+def validate_or_create_excel(path: str):
+    """
+    Ensures the Excel file at 'path' exists and has the correct headers.
+    If it exists with *incorrect* headers, it backs up the old file
+    and creates a new, correct one.
+    """
+    if not os.path.exists(path):
+        # File doesn't exist, create a new one
+        _create_new_excel(path)
         return
+
+    try:
+        wb = load_workbook(path)
+        ws = wb.active
+        
+        # Read headers from the first row
+        existing_headers = [cell.value for cell in ws[1]]
+        
+        if existing_headers == DEFAULT_COLS:
+            # --- FIX: Apply validation to existing file ---
+            print("Excel file is valid. Applying/checking dropdowns...")
+            _apply_dropdown_validation(ws)
+            wb.save(path) # Save any changes
+            # --- END FIX ---
+            return
+        else:
+            # Headers are wrong! Backup and create new.
+            log_error(f"Excel headers mismatch in {path}. Backing up and creating new file.")
+            
+            bak_path = path + ".bak"
+            i = 1
+            while os.path.exists(bak_path):
+                bak_path = f"{path}.bak{i}"
+                i += 1
+                
+            os.rename(path, bak_path)
+            log_error(f"Backed up old file to {bak_path}")
+            
+            _create_new_excel(path)
+            
+    except (InvalidFileException, KeyError, zipfile.BadZipFile):
+        # File is corrupted or not an Excel file
+        log_error(f"Corrupted Excel file {path}. Moving it and creating new.")
+        if os.path.exists(path):
+            os.remove(path)
+        _create_new_excel(path)
+    except Exception as e:
+        log_error(f"Error validating Excel file {path}: {e}. Creating new.")
+        if os.path.exists(path):
+            os.remove(path) # Remove to avoid loops
+        _create_new_excel(path)
+
+def _create_new_excel(path: str):
+    """Internal helper to create a new Excel file with headers."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Applicants"
-    
-    # Use standard columns regardless of input
     ws.append(DEFAULT_COLS)
     
-    # Adjust column widths for readability
-    try:
-        ws.column_dimensions['A'].width = 8  # S.No.
-        ws.column_dimensions['B'].width = 30 # Name
-        ws.column_dimensions['C'].width = 40 # Email
-        ws.column_dimensions['D'].width = 30 # Phone
-        ws.column_dimensions['E'].width = 35 # OriginalFile
-        ws.column_dimensions['F'].width = 15 # DateApplied
-        ws.column_dimensions['G'].width = 50 # ResumePath
-    except Exception:
-        pass # Not critical
-        
+    # --- NEW: Call the reusable function ---
+    _apply_dropdown_validation(ws)
+    # --- END NEW ---
+    
     wb.save(path)
 
+def get_next_serial_number(path: str) -> int:
+    """Gets the next serial number by reading the last S.No. in the file."""
+    if not os.path.exists(path):
+        return 1
+    try:
+        wb = load_workbook(path)
+        ws = wb.active
+        for row in range(ws.max_row, 1, -1):
+            cell_value = ws.cell(row=row, column=1).value
+            if cell_value is not None:
+                try:
+                    return int(cell_value) + 1
+                except ValueError:
+                    continue 
+        return 1
+    except (InvalidFileException, KeyError, zipfile.BadZipFile):
+        log_error(f"Corrupted Excel file {path} while getting S.No. Creating new.")
+        os.remove(path)
+        _create_new_excel(path)
+        return 1
+    except Exception as e:
+        log_error(f"Error reading serial number from {path}: {e}")
+        return 1
 
-def append_row(path: str, data: dict):
+# --- FIX: Bug `TypeError: append_row() missing...` ---
+# This version matches the call in the corrected app.py
+def append_row(path: str, data: dict) -> int:
     """
-    Append a data row to Excel; create file/header if needed.
-    data: dict with keys matching columns (Name, Email, Phone, OriginalFile, ResumePath)
+    Append a data row to Excel. Returns the new serial number.
+    data: dict with keys "Name", "Email", "Phone"
     """
     try:
-        if os.path.exists(path):
-            wb = load_workbook(path)
-        else:
-            # This case should be handled by ensure_excel, but as a fallback:
-            wb = Workbook()
-
+        wb = load_workbook(path)
         ws = wb.active
-        serial_num = 1
         
-        # set header if empty
-        if ws.max_row == 1 and ws.cell(1, 1).value is None:
-            ws.append(DEFAULT_COLS)
-        else:
-            # S.No. is the current max_row (since header is 1, first data is 2)
-            serial_num = ws.max_row 
-
-        today = date.today().isoformat()
+        serial_num = get_next_serial_number(path)
         
-        # Build row based on DEFAULT_COLS order
+        # --- FIX: Handle email being a list or string ---
+        email_val = data.get("Email", "")
+        if isinstance(email_val, list):
+            email_val = ", ".join(email_val)
+        
         row = [
             serial_num,
             data.get("Name", ""),
-            data.get("Email", ""),
+            email_val,
             data.get("Phone", ""),
-            data.get("OriginalFile", ""), # New field
-            today,
-            data.get("ResumePath", "")
-        ]
-        
-        ws.append(row)
-        wb.save(path)
-    except PermissionError as pe:
-        log_error(f"Excel append failed (PermissionError): {pe}. File might be open.")
-        raise # Re-raise so UI can handle it
-    except Exception as e:
-        log_error(f"Excel append failed: {e}\n{repr(e)}")
-        raise # Re-raise so UI can handle it
-
-
-def read_all_rows(path: str):
-    """Return list of value-tuples from Excel (skips header)."""
-    if not os.path.exists(path):
-        return []
-    
-    rows = []
-    try:
-        wb = load_workbook(path, data_only=True)
-        ws = wb.active
-        for r in ws.iter_rows(min_row=2, values_only=True):
-            if any(r): # Only add rows that are not entirely empty
-                rows.append(r)
-    except Exception as e:
-        log_error(f"Failed to read Excel file {path}: {e}")
-        # Try to return empty list instead of crashing
-        return []
-    return rows
-
-
-def email_duplicate_within_days(path: str, email_str: str, days: int) -> bool:
-    """
-    Return True if any email in email_str exists in Excel and DateApplied is within `days`.
-    Conservative behavior: if date parsing fails, treat as duplicate.
-    """
-    if not os.path.exists(path) or not email_str:
-        return False
-        
-    # Get set of emails to check
-    emails_to_check = set(e.strip().lower() for e in email_str.split(',') if e.strip())
-    if not emails_to_check:
-        return False
-        
-    try:
-        wb = load_workbook(path, data_only=True)
-        ws = wb.active
-
-        # Read all rows into memory for faster checking
-        # This assumes the excel file is not excessively large (e.g., > 50k rows)
-        # For very large files, iter_rows is better but slower.
-        all_rows = list(ws.iter_rows(min_row=2, values_only=True))
-        if not all_rows:
-            return False
-
-        # Create a set of all emails already in the sheet for quick lookup
-        existing_emails_map = {} # Map email -> applied_date
-        
-        for r in all_rows:
-            row_email_data = r[EMAIL_COL_IDX] if len(r) > EMAIL_COL_IDX else None
-            row_date = r[DATE_COL_IDX] if len(r) > DATE_COL_IDX else None
-
-            if not row_email_data:
-                continue
-                
-            # Handle multiple emails in the cell
-            row_emails = [e.strip().lower() for e in str(row_email_data).split(',') if e.strip()]
-            for remail in row_emails:
-                if remail not in existing_emails_map:
-                     existing_emails_map[remail] = row_date # Store first date found
-
-        # Now check for duplicates
-        for check_email in emails_to_check:
-            if check_email in existing_emails_map:
-                row_date = existing_emails_map[check_email]
-                # If there's no date stored, treat as duplicate (safer)
-                if not row_date:
-                    return True
-
-                # Normalize various date types (datetime, date, iso string)
-                try:
-                    if isinstance(row_date, str):
-                        applied_dt = datetime.fromisoformat(row_date)
-                    elif isinstance(row_date, datetime):
-                        applied_dt = row_date
-                    elif isinstance(row_date, date):
-                        # row_date is date-like (datetime.date)
-                        applied_dt = datetime.combine(row_date, datetime.min.time())
-                    else:
-                        return True # Unknown date format, treat as duplicate
-
-                    delta_days = (datetime.now() - applied_dt).days
-                    if delta_days <= int(days):
-                        return True # Found a duplicate within the window
-                except Exception:
-                    # If parsing date fails, conservatively treat as duplicate
-                    return True
-                    
-    except Exception as e:
-        log_error(f"email_duplicate_within_days error: {e}\n{repr(e)}")
-        # Be conservative on error
-        return True # Treat as duplicate if check fails
-
-    return False
-
-
-def save_to_excel(data: dict, excel_path: str = "resumes_data.xlsx", columns=None):
-    """
-    Compatibility wrapper.
-    This simply calls append_row(...) from this module.
-    """
-    append_row(excel_path, data)        # set header if empty
-        if ws.max_row == 1 and ws.cell(1, 1).value is None:
-            if not columns:
-                columns = ["Name", "Email", "Phone", "Skills", "Experience", "DateApplied", "ResumePath"]
-            ws.append(columns)
-
-        today = date.today().isoformat()
-        row = [
-            data.get("Name", ""),
-            data.get("Email", ""),
-            data.get("Phone", ""),
-            data.get("Skills", ""),
-            data.get("Experience", ""),
-            today,
-            data.get("ResumePath", "")
+            "", # Status - defaults to empty
         ]
         ws.append(row)
         wb.save(path)
+        return serial_num
     except Exception as e:
-        # log the error and re-raise so calling code can handle it
-        try:
-            log_error("Excel append failed: " + str(e) + "\n" + repr(e))
-        except Exception:
-            pass
+        log_error(f"Excel append failed: {e}")
         raise
 
-
 def read_all_rows(path: str):
     """Return list of value-tuples from Excel (skips header)."""
     if not os.path.exists(path):
         return []
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    rows = []
-    for r in ws.iter_rows(min_row=2, values_only=True):
-        rows.append(r)
-    return rows
-
+    try:
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        rows = []
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            row_data = list(r)
+            if len(row_data) < len(DEFAULT_COLS):
+                row_data.extend([""] * (len(DEFAULT_COLS) - len(row_data)))
+            elif len(row_data) > len(DEFAULT_COLS):
+                row_data = row_data[:len(DEFAULT_COLS)]
+            rows.append(tuple(row_data))
+        return rows
+    except Exception as e:
+        log_error(f"Failed to read Excel {path}: {e}")
+        return []
 
 def email_duplicate_within_days(path: str, email: str, days: int) -> bool:
     """
-    Return True if same email exists in Excel and DateApplied is within `days`.
-    Conservative behavior: if date parsing fails, treat as duplicate.
+    Checks for email duplicates.
+    NOTE: This is not currently used in the app, but kept for future use.
     """
-    if not os.path.exists(path) or not email:
-        return False
-    try:
-        wb = load_workbook(path, data_only=True)
-        ws = wb.active
-        from datetime import datetime
-
-        email_norm = str(email).strip().lower()
-        for r in ws.iter_rows(min_row=2, values_only=True):
-            # Expecting row like: Name, Email, Phone, Skills, Experience, DateApplied, ResumePath
-            row_email = r[1] if len(r) > 1 else None
-            row_date = r[5] if len(r) > 5 else None
-
-            if not row_email:
-                continue
-            if str(row_email).strip().lower() != email_norm:
-                continue
-
-            # If there's no date stored, treat as duplicate (safer)
-            if not row_date:
-                return True
-
-            # Normalize various date types (datetime, date, iso string)
-            try:
-                if isinstance(row_date, str):
-                    applied_dt = datetime.fromisoformat(row_date)
-                else:
-                    # openpyxl may return a datetime.date or datetime.datetime
-                    if isinstance(row_date, datetime):
-                        applied_dt = row_date
-                    else:
-                        # row_date is date-like (datetime.date)
-                        applied_dt = datetime.combine(row_date, datetime.min.time())
-                delta_days = (datetime.now() - applied_dt).days
-                if delta_days <= int(days):
-                    return True
-            except Exception:
-                # If parsing date fails, conservatively treat as duplicate
-                return True
-    except Exception as e:
-        try:
-            log_error("email_duplicate_within_days error: " + str(e) + "\n" + repr(e))
-        except Exception:
-            pass
-        return False
-
     return False
 
-
-def save_to_excel(data: dict, excel_path: str = "resumes_data.xlsx", columns=None):
-    """
-    Compatibility wrapper so other modules can call save_to_excel(...).
-    This simply calls append_row(...) from this module.
-    """
-    append_row(excel_path, data, columns)
-
-def get_headers(path: str):
-    """
-    Return a list of header strings from the first row of the active sheet.
-    If file does not exist, returns empty list.
-    """
+def update_status(path: str, serial_num: int, new_status: str) -> bool:
+    """Finds a row by its S.No. and updates its Status."""
     if not os.path.exists(path):
-        return []
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    headers = []
-    for cell in ws[1]:
-        headers.append(cell.value if cell.value is not None else "")
-    return headers
-
-def update_headers(path: str, new_headers):
-    """
-    Replace header row of the Excel file with new_headers (list of str).
-    Backup created: <file>.bak
-    Data rows are padded/truncated to match new header length.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Excel file not found: {path}")
-
-    # create backup
-    bak_path = path + ".bak"
+        return False
     try:
-        copy2(path, bak_path)
-    except Exception:
-        # if backup fails, set bak_path = None but continue
-        bak_path = None
+        wb = load_workbook(path)
+        ws = wb.active
+        
+        status_col = -1
+        for c_idx, cell in enumerate(ws[1], 1):
+            if cell.value == "Status":
+                status_col = c_idx
+                break
+        
+        if status_col == -1:
+            log_error("Could not find 'Status' column in Excel.")
+            return False
 
-    wb = load_workbook(path)
-    ws = wb.active
+        row_to_update = -1
+        for r_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
+            if row[0].value == serial_num:
+                row_to_update = r_idx
+                break
+        
+        if row_to_update != -1:
+            ws.cell(row=row_to_update, column=status_col, value=new_status)
+            wb.save(path)
+            return True
+        else:
+            log_error(f"Could not find S.No. {serial_num} to update status.")
+            return False
+    except Exception as e:
+        log_error(f"Failed to update status for S.No. {serial_num}: {e}")
+        return False
 
-    # collect existing rows (values_only)
-    rows = []
-    for r in ws.iter_rows(values_only=True):
-        rows.append(list(r) if r is not None else [])
+def export_by_status(excel_path: str, destination_folder: str):
+    """
+    Reads the master Excel file and creates a new Excel file
+    for EACH unique status found (e.g., Accepted_Candidates.xlsx,
+    Rejected_Candidates.xlsx, On_Hold_Candidates.xlsx).
+    """
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Master file not found: {excel_path}")
 
-    data_rows = rows[1:] if len(rows) > 1 else []
+    master_wb = load_workbook(excel_path, data_only=True)
+    master_ws = master_wb.active
+    
+    headers = [cell.value for cell in master_ws[1]]
+    
+    try:
+        status_col_index = headers.index("Status")
+    except ValueError:
+        raise ValueError("Master file is missing the 'Status' column.")
 
-    # build new workbook
-    new_wb = Workbook()
-    new_ws = new_wb.active
-    new_ws.title = ws.title if ws.title else "Applicants"
+    # --- UPDATED: Dynamic Status Handling ---
+    
+    # 1. Find all unique statuses and create workbooks for them
+    status_workbooks = {} 
+    
+    for row in master_ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) <= status_col_index:
+            continue
+            
+        status = row[status_col_index]
+        
+        if not status:
+            continue
+            
+        if status not in status_workbooks:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = status[:30]
+            ws.append(headers)
+            status_workbooks[status] = {"wb": wb, "ws": ws}
+            
+        status_workbooks[status]["ws"].append(row)
 
-    # write header
-    new_ws.append(list(new_headers))
+    # 2. Save all the new workbooks
+    created_file_paths = []
+    
+    if not status_workbooks:
+        return []
 
-    new_len = len(new_headers)
-    for r in data_rows:
-        r = r if r is not None else []
-        # ensure exact length
-        row_vals = r[:new_len] + [""] * max(0, new_len - len(r))
-        new_ws.append(row_vals)
-
-    new_wb.save(path)
-    return True
-
+    for status, data in status_workbooks.items():
+        safe_filename = str(status).replace(" ", "_").replace("/", "-")
+        
+        file_path = os.path.join(destination_folder, f"{safe_filename}_Candidates.xlsx")
+        data["wb"].save(file_path)
+        created_file_paths.append(file_path)
+    
+    return created_file_paths
