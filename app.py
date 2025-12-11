@@ -4,14 +4,12 @@ import sys
 import threading
 import traceback
 import subprocess
+import re  # Added for experience parsing
 from pathlib import Path
 from shutil import copy2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Set
-# import time # No longer needed
-
-# --- 'watchdog' imports have been REMOVED ---
 
 # App modules
 from utils import load_config, save_config, log_error, ensure_dirs, check_ollama_connection
@@ -21,6 +19,7 @@ from excel_handler import (
     read_all_rows, append_row, 
     update_status, export_by_status, DEFAULT_COLS
 )
+from db_handler import CandidateDB  # --- NEW IMPORT ---
 
 # ----------------- Configuration / Workspace -----------------
 HOME = Path.home()
@@ -34,6 +33,9 @@ EXCEL_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG = load_config()
 
+# --- Initialize Database ---
+DB = CandidateDB()
+
 # --- Validate Active Excel Path ---
 active_excel_path_str = CONFIG.get("active_excel", str(EXCEL_DIR / "resumes_data.xlsx"))
 ACTIVE_EXCEL = Path(active_excel_path_str)
@@ -45,9 +47,11 @@ if not ACTIVE_EXCEL.exists() and ACTIVE_EXCEL.parent != EXCEL_DIR:
 
 DUPLICATE_CHECK_ENABLED = CONFIG.get("duplicate_check_enabled", True)
 
-# --- NEW: Status Options ---
+# --- Status Options ---
 STATUS_OPTIONS = [
-    "", 
+    "New Applicant", 
+    "Re-Applicant (Updated)", 
+    "Duplicate (Ignored)",
     "Accepted", 
     "Rejected", 
     "On Hold", 
@@ -62,7 +66,6 @@ try:
     if not success:
         raise OSError(model_or_error)
     MODEL_DISPLAY_NAME = f"(Model: {model_or_error} via Ollama)"
-    # nlp=None is just a placeholder, parser.py doesn't use it
     nlp = None
 except Exception as e:
     nlp = None
@@ -70,7 +73,6 @@ except Exception as e:
     log_error(f"Ollama connection error: {e}\n{traceback.format_exc()}")
     
     # We must show the error on startup
-    # Create a dummy root to show the message
     dummy_root = tk.Tk()
     dummy_root.withdraw()
     messagebox.showerror("Fatal Model Error",
@@ -80,18 +82,15 @@ except Exception as e:
                          "1. The Ollama application is running.\n"
                          "2. You have run: `ollama pull llama3:8b`")
     dummy_root.destroy()
-    # We let the app continue, but parsing will fail.
 
 # ----------------- Global Threading Control -----------------
 PARSING_THREAD = None
 STOP_EVENT = None
-# --- REMOVED: File Watcher globals ---
-
 
 # ----------------- Main window -----------------
 root = tk.Tk()
-root.title(f"Resume Parser {MODEL_DISPLAY_NAME}")
-root.geometry("1200x700")
+root.title(f"Resume Parser Pro {MODEL_DISPLAY_NAME}")
+root.geometry("1250x750")
 
 # --- Styling ---
 style = ttk.Style(root)
@@ -102,7 +101,6 @@ style.configure("Details.TLabel", background="#f0f0f0", font=('Arial', 10))
 style.configure("Details.TButton", font=('Arial', 10, 'bold'))
 style.configure("Title.TLabel", background="#f0f0f0", font=('Arial', 12, 'bold'))
 style.configure("Stop.TButton", font=('Arial', 10, 'bold'), foreground="red", background="white")
-
 
 # ----------------- PanedWindow Layout -----------------
 paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL)
@@ -123,7 +121,7 @@ frame_left_controls.pack(side="left")
 btn_single = ttk.Button(frame_left_controls, text="Upload Resume", command=lambda: on_upload("file"))
 btn_single.pack(side="left", padx=6)
 
-btn_multi = ttk.Button(frame_left_controls, text="Upload Multiple Resumes", command=lambda: on_upload("files"))
+btn_multi = ttk.Button(frame_left_controls, text="Upload Multiple", command=lambda: on_upload("files"))
 btn_multi.pack(side="left", padx=6)
 
 btn_folder = ttk.Button(frame_left_controls, text="Upload Folder", command=lambda: on_upload("folder"))
@@ -139,7 +137,7 @@ btn_stop = ttk.Button(
 var_dup = tk.BooleanVar(value=DUPLICATE_CHECK_ENABLED)
 chk_dup = ttk.Checkbutton(
     frame_left_controls, 
-    text="Check for Duplicates", 
+    text="Master Record Check (DB)", 
     variable=var_dup,
     command=lambda: save_dup_config()
 )
@@ -176,29 +174,32 @@ entry_search = ttk.Entry(frame_search, textvariable=search_var, width=50)
 entry_search.pack(side="left", fill="x", expand=True, padx=(0,6))
 
 # Tree (results)
-# --- UPDATED: Removed 'OriginalFile' column ---
-tree_cols = ["S.No.", "Name", "Email", "Phone", "Status"]
+# --- UPDATED: Added 'Experience' column ---
+tree_cols = ["S.No.", "Name", "Email", "Phone", "Experience", "Status"]
 tree = ttk.Treeview(
     top_pane, 
     columns=tree_cols, 
     show="headings",
-    displaycolumns=tree_cols # Show all columns
+    displaycolumns=tree_cols 
 )
 
 tree.heading("S.No.", text="S.No.", anchor="w")
-tree.column("S.No.", width=60, anchor="w")
+tree.column("S.No.", width=50, anchor="w")
 
 tree.heading("Name", text="Name", anchor="w")
-tree.column("Name", width=200, anchor="w")
+tree.column("Name", width=180, anchor="w")
 
 tree.heading("Email", text="Email", anchor="w")
-tree.column("Email", width=250, anchor="w")
+tree.column("Email", width=220, anchor="w")
 
 tree.heading("Phone", text="Phone", anchor="w")
-tree.column("Phone", width=150, anchor="w")
+tree.column("Phone", width=120, anchor="w")
+
+tree.heading("Experience", text="Exp (Yrs)", anchor="w") # New Column
+tree.column("Experience", width=80, anchor="w")
 
 tree.heading("Status", text="Status", anchor="w")
-tree.column("Status", width=150, anchor="w") # Made wider for new statuses
+tree.column("Status", width=180, anchor="w")
 
 tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -211,56 +212,48 @@ ttk.Label(bottom_pane, text="Candidate Details", style="Title.TLabel").pack(anch
 details_frame = ttk.Frame(bottom_pane, style="Details.TFrame")
 details_frame.pack(fill="x", expand=True, padx=12)
 
-# Grid layout for details
 details_frame.columnconfigure(1, weight=1)
 
 # --- Variables for Details Panel ---
-detail_sno_var = tk.StringVar(value="-")
-detail_name_var = tk.StringVar(value="-")
-detail_email_var = tk.StringVar(value="-")
-detail_phone_var = tk.StringVar(value="-")
-detail_status_var = tk.StringVar()
-# REMOVED: detail_original_file_var
+detail_vars = {
+    "S.No": tk.StringVar(value="-"),
+    "Name": tk.StringVar(value="-"),
+    "Email": tk.StringVar(value="-"),
+    "Phone": tk.StringVar(value="-"),
+    "Experience": tk.StringVar(value="-"), # New Variable
+    "Status": tk.StringVar()
+}
 
-# Row 0: S.No.
-ttk.Label(details_frame, text="S.No:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky="w", padx=5, pady=2)
-ttk.Label(details_frame, textvariable=detail_sno_var, style="Details.TLabel").grid(row=0, column=1, sticky="w", padx=5, pady=2)
+# Layout Details
+row_idx = 0
+for label_text, var in detail_vars.items():
+    if label_text == "Status": continue
+    ttk.Label(details_frame, text=f"{label_text}:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+    ttk.Label(details_frame, textvariable=var, style="Details.TLabel").grid(row=row_idx, column=1, sticky="w", padx=5, pady=2)
+    row_idx += 1
 
-# Row 1: Name
-ttk.Label(details_frame, text="Name:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky="w", padx=5, pady=2)
-ttk.Label(details_frame, textvariable=detail_name_var, style="Details.TLabel").grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-# Row 2: Email
-ttk.Label(details_frame, text="Email:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=2, column=0, sticky="w", padx=5, pady=2)
-ttk.Label(details_frame, textvariable=detail_email_var, style="Details.TLabel").grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-# Row 3: Phone
-ttk.Label(details_frame, text="Phone:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=3, column=0, sticky="w", padx=5, pady=2)
-ttk.Label(details_frame, textvariable=detail_phone_var, style="Details.TLabel").grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-# Row 4: Status Dropdown
-ttk.Label(details_frame, text="Status:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=4, column=0, sticky="w", padx=5, pady=8)
+# Status Dropdown
+ttk.Label(details_frame, text="Status:", style="Details.TLabel", font=('Arial', 10, 'bold')).grid(row=row_idx, column=0, sticky="w", padx=5, pady=8)
 status_combobox = ttk.Combobox(
     details_frame,
-    textvariable=detail_status_var,
-    values=STATUS_OPTIONS, # --- UPDATED: Use new status list ---
+    textvariable=detail_vars["Status"],
+    values=STATUS_OPTIONS, 
     state="readonly",
-    width=25 # --- NEW: Made wider ---
+    width=25
 )
-status_combobox.grid(row=4, column=1, sticky="w", padx=5, pady=8)
+status_combobox.grid(row=row_idx, column=1, sticky="w", padx=5, pady=8)
+row_idx += 1
 
-# Row 5: Save Button
+# Save Button
 btn_save_status = ttk.Button(
     details_frame, 
     text="Save Status", 
     style="Details.TButton",
     command=lambda: save_candidate_status()
 )
-btn_save_status.grid(row=5, column=1, sticky="w", padx=5, pady=10)
+btn_save_status.grid(row=row_idx, column=1, sticky="w", padx=5, pady=10)
 
-# REMOVED: btn_view_resume
-
-# Store the currently selected real S.No. (IID)
+# Store the currently selected real S.No.
 current_selected_sno = None
 
 # --- Status Bar ---
@@ -275,12 +268,10 @@ lbl_status.pack(fill="x", padx=12, pady=(0, 6))
 # ----------------- GUI Helper Functions -----------------
 def ui_call(fn, *a, **kw):
     """Helper to run a function on the main GUI thread."""
-    # Check if root window still exists
     if root.winfo_exists():
         root.after(0, lambda: fn(*a, **kw))
 
 def add_status(text: str):
-    """Append a status line to the status bar (thread-safe)."""
     ui_call(lbl_status.config, text=text)
 
 def open_in_explorer(path: Path):
@@ -298,7 +289,6 @@ def open_in_explorer(path: Path):
         messagebox.showerror("Open Error", f"Could not open {path}: {e}")
 
 def set_active_excel(path: Path):
-    """Updates the global ACTIVE_EXCEL, saves config, and updates UI."""
     global ACTIVE_EXCEL
     ACTIVE_EXCEL = path
     CONFIG["active_excel"] = str(ACTIVE_EXCEL)
@@ -309,7 +299,6 @@ def set_active_excel(path: Path):
     add_status(f"Active Excel set to {ACTIVE_EXCEL.name}")
 
 def select_active_excel():
-    """Lets user create or select an Excel file."""
     file = filedialog.asksaveasfilename(
         initialdir=str(EXCEL_DIR),
         title="Select or Create Excel File",
@@ -321,17 +310,13 @@ def select_active_excel():
     set_active_excel(Path(file))
 
 def save_dup_config():
-    """Saves the duplicate check setting to config.json."""
     CONFIG["duplicate_check_enabled"] = var_dup.get()
     save_config(CONFIG)
-    add_status(f"Duplicate check {'enabled' if var_dup.get() else 'disabled'}.")
+    add_status(f"Master Record Check {'enabled' if var_dup.get() else 'disabled'}.")
 
 # ----------------- GUI Behavior Functions -----------------
 def refresh_tree_from_excel():
     """Load rows from Excel into the tree."""
-    # --- REMOVED: global ITEMS_BEING_ADDED ---
-    
-    # Clear all items from the tree
     for r in tree.get_children():
         tree.delete(r)
     
@@ -340,65 +325,41 @@ def refresh_tree_from_excel():
         return
         
     try:
-        headers = DEFAULT_COLS
-        sno_idx = headers.index("S.No.")
-        name_idx = headers.index("Name")
-        email_idx = headers.index("Email")
-        phone_idx = headers.index("Phone")
-        status_idx = headers.index("Status")
-        # REMOVED: original_file_idx
+        # Assuming DEFAULT_COLS are [S.No., Name, Email, Phone, Experience, Status]
+        # We access by index to be safe
+        pass 
     except ValueError as e:
         messagebox.showerror("Excel Error", f"Your Excel file is missing a required column: {e}")
         return
 
     # Add data to tree
     for i, r in enumerate(rows):
-        real_sno = r[sno_idx]
-        if real_sno is None: # Skip empty S.No. rows
-            continue
+        # r structure: (SNo, Name, Email, Phone, Exp, Status)
+        real_sno = r[0]
+        if real_sno is None: continue
             
-        # --- Simplified: iid can be a string or int, but we'll cast to int ---
         real_sno_int = int(real_sno)
         
-        # --- FIX: Prevent `TclError: Item X already exists` ---
-        # This check is still good, though the watcher was the main cause
+        # Ensure we have enough columns (handle old excel files without Experience)
+        # Pad with empty string if Exp or Status missing
+        r_list = list(r)
+        while len(r_list) < 6:
+            r_list.append("")
+        
+        values = (r_list[0], r_list[1], r_list[2], r_list[3], r_list[4], r_list[5])
+
         if tree.exists(real_sno_int):
-            # Just update the values, in case they changed
-            display_sno = tree.item(real_sno_int, "values")[0]
-            tree.item(real_sno_int, values=(
-                display_sno,
-                r[name_idx],
-                r[email_idx],
-                r[phone_idx],
-                r[status_idx]
-            ))
+            tree.item(real_sno_int, values=values)
             continue
             
-        # If it's a new item, add it
-        display_sno = i + 1
-        
-        tree.insert(
-            "", 
-            "end", 
-            iid=real_sno_int, 
-            values=(
-                display_sno,
-                r[name_idx],
-                r[email_idx],
-                r[phone_idx],
-                r[status_idx]
-            )
-        )
-    
-    # --- REMOVED: ITEMS_BEING_ADDED = set() ---
+        tree.insert("", "end", iid=real_sno_int, values=values)
 
 def on_tree_select(event):
     """Fired when a user clicks a row. Populates the details panel."""
     global current_selected_sno
     
     selected_item = tree.focus() 
-    if not selected_item:
-        return
+    if not selected_item: return
     
     try:
         current_selected_sno = int(selected_item) 
@@ -407,18 +368,17 @@ def on_tree_select(event):
         return 
     
     values = tree.item(selected_item, "values")
+    # values = (sno, name, email, phone, experience, status)
     
-    # values = (display_sno, name, email, phone, status)
-    detail_sno_var.set(str(current_selected_sno)) 
-    detail_name_var.set(values[1])
-    detail_email_var.set(values[2])
-    detail_phone_var.set(values[3])
-    detail_status_var.set(values[4])
-    # REMOVED: detail_original_file_var
+    if len(values) >= 6:
+        detail_vars["S.No"].set(values[0])
+        detail_vars["Name"].set(values[1])
+        detail_vars["Email"].set(values[2])
+        detail_vars["Phone"].set(values[3])
+        detail_vars["Experience"].set(values[4])
+        detail_vars["Status"].set(values[5])
 
 tree.bind("<<TreeviewSelect>>", on_tree_select)
-
-# REMOVED: open_original_file()
 
 def save_candidate_status():
     """Saves the status from the combobox to the Excel file."""
@@ -426,17 +386,16 @@ def save_candidate_status():
         messagebox.showwarning("No Candidate", "Please select a candidate from the list.")
         return
         
-    new_status = detail_status_var.get()
+    new_status = detail_vars["Status"].get()
     
     def save_in_thread():
         try:
             success = update_status(str(ACTIVE_EXCEL), current_selected_sno, new_status)
             if success:
                 ui_call(add_status, f"Status updated for S.No. {current_selected_sno}")
-                # --- UPDATE: Manually update the tree row after saving ---
-                # (display_sno, name, email, phone, status)
+                # Update tree manually
                 current_values = list(tree.item(current_selected_sno, "values"))
-                current_values[4] = new_status # Update status
+                current_values[5] = new_status # Status is index 5
                 ui_call(tree.item, current_selected_sno, values=tuple(current_values))
             else:
                 ui_call(add_status, f"Error updating status for S.No. {current_selected_sno}")
@@ -451,9 +410,8 @@ def on_search_change(*_):
     q = search_var.get().strip().lower()
     for item_id in tree.get_children(): 
         values = tree.item(item_id, "values")
-        # values = (display_sno, name, email, phone, status)
-        # Search in name, email, phone, status (cols 1, 2, 3, 4)
-        combined = " ".join([str(v).lower() for v in values[1:5]])
+        # Search in Name, Email, Phone, Experience, Status
+        combined = " ".join([str(v).lower() for v in values[1:]])
         
         if q == "" or q in combined:
             tree.reattach(item_id, "", "end")
@@ -462,140 +420,175 @@ def on_search_change(*_):
 
 entry_search.bind("<KeyRelease>", on_search_change)
 
-# ----------------- Processing Worker -----------------
-def process_files_sequential(file_paths, check_duplicates, stop_event):
-    """Background worker to parse files, save to Excel, update UI."""
-    # --- REMOVED: global ITEMS_BEING_ADDED ---
+# ----------------- Processing Worker (Updated with DB Logic) -----------------
+def process_files_sequential(raw_paths, check_db, stop_event):
+    """Background worker to parse files, check DB, save to Excel."""
     
-    ui_call(progress.config, mode="determinate", maximum=len(file_paths), value=0)
-    add_status(f"Starting to process {len(file_paths)} files...")
+    # --- 1. Copy Phase (Inside Thread) ---
+    ui_call(progress.config, mode="indeterminate")
+    add_status(f"Preparing {len(raw_paths)} files...")
+    print(f"--- Starting Batch: {len(raw_paths)} files ---")
+    
+    processed_paths = []
+    
+    # Copy files
+    for i, fp in enumerate(raw_paths):
+        if stop_event.is_set(): break
+        try:
+            if i % 10 == 0:
+                add_status(f"Copying file {i+1}/{len(raw_paths)}...")
+            dst = safe_copy_to_workspace(fp)
+            processed_paths.append(str(dst))
+        except Exception as e:
+            print(f"[Error] Failed to copy {fp}: {e}")
+            log_error(f"Copy failed for {fp}: {e}")
+
+    if stop_event.is_set():
+        ui_call(progress.config, value=0)
+        add_status("Stopped during file preparation.")
+        ui_call(parsing_complete)
+        return
+
+    # --- 2. Parsing Phase ---
+    ui_call(progress.config, mode="determinate", maximum=len(processed_paths), value=0)
+    add_status(f"Starting analysis of {len(processed_paths)} resumes...")
     
     success_count = 0
     fail_count = 0
-    skip_count = 0
+    update_count = 0
+    dupe_count = 0
     stopped = False
     
-    existing_emails = set()
-    if check_duplicates:
-        try:
-            add_status("Scanning for existing emails...")
-            rows = read_all_rows(str(ACTIVE_EXCEL))
-            email_idx = DEFAULT_COLS.index("Email")
-            for r in rows:
-                if r[email_idx]:
-                    # --- FIX: Handle emails being a list (from previous bug) ---
-                    emails_in_cell_raw = r[email_idx]
-                    if isinstance(emails_in_cell_raw, list):
-                        emails_in_cell_raw = ", ".join(emails_in_cell_raw)
-                    
-                    emails_in_cell = emails_in_cell_raw.lower().split(',')
-                    for e in emails_in_cell:
-                        if e.strip():
-                            existing_emails.add(e.strip())
-            add_status(f"Found {len(existing_emails)} unique emails in database.")
-        except Exception as e:
-            log_error(f"Error reading emails for duplicate check: {e}")
-            ui_call(messagebox.showwarning, "Duplicate Check Error", 
-                    f"Could not read existing emails: {e}\nDuplicate check may be incomplete.")
-    
-    for i, fp in enumerate(file_paths):
+    for i, fp in enumerate(processed_paths):
         if stop_event.is_set():
             stopped = True
-            add_status(f"Parsing stopped by user at file {i+1}.")
             break 
             
         fname = Path(fp).name
+        
+        # --- VERBOSE CONSOLE OUTPUT ---
+        print(f"[{i+1}/{len(processed_paths)}] Analyzing: {fname}")
+        sys.stdout.flush() # Force CMD update
+        
         try:
-            add_status(f"Processing ({i+1}/{len(file_paths)}): {fname}...")
-            # We pass the dummy `nlp` object, it isn't used by the new parser
-            data = parse_resume(fp, nlp) 
+            add_status(f"Parsing ({i+1}/{len(processed_paths)}): {fname}...")
+            
+            # 1. PARSE
+            data = parse_resume(fp) 
+            
             if not data:
-                # --- UPDATE: More helpful error ---
-                add_status(f"Failed: {fname}. See logs/errors.log for details.")
+                print(f"  -> FAILED to extract data from {fname}")
+                add_status(f"Failed: {fname}. See logs.")
                 fail_count += 1
                 continue
 
-            # --- Duplicate Check Logic (Handles list and str) ---
-            if check_duplicates:
-                parsed_emails_raw = data.get("Email", "")
-                parsed_emails = []
-                
-                # --- FIX: Handle 'list' object has no attribute 'lower' ---
-                if isinstance(parsed_emails_raw, list):
-                    parsed_emails = [e.lower().strip() for e in parsed_emails_raw if e.strip()]
-                elif isinstance(parsed_emails_raw, str):
-                    parsed_emails = [e.lower().strip() for e in parsed_emails_raw.split(',') if e.strip()]
+            print(f"  -> Extracted: {data.get('Name', 'Unknown')} | {data.get('Email', 'No Email')}")
 
-                found_duplicate = False
-                for e in parsed_emails:
-                    if e in existing_emails:
-                        found_duplicate = True
-                        break
+            # 2. EXTRACT & NORMALIZE
+            email = data.get("Email", "").strip().lower()
+            if isinstance(email, list): email = email[0] if email else ""
+            
+            # Parse Experience (clean up "5 years" -> 5.0)
+            new_exp_str = str(data.get("Experience", "0")).lower().replace("years", "").strip()
+            try:
+                # Find first float/int in string
+                matches = re.findall(r"[\d\.]+", new_exp_str)
+                new_exp_val = float(matches[0]) if matches else 0.0
+            except:
+                new_exp_val = 0.0
+
+            status_to_save = "New Applicant"
+
+            # 3. DB CHECK (MASTER RECORD)
+            if check_db and email:
+                existing_candidate = DB.get_candidate(email)
                 
-                if found_duplicate:
-                    add_status(f"Skipped: {fname} (Email already exists)")
-                    skip_count += 1
-                    ui_call(progress.step, 1) 
-                    continue
+                if existing_candidate:
+                    # Compare Experience
+                    old_exp_str = str(existing_candidate["experience"])
+                    try:
+                        matches = re.findall(r"[\d\.]+", old_exp_str)
+                        old_exp_val = float(matches[0]) if matches else 0.0
+                    except:
+                        old_exp_val = 0.0
+                    
+                    # Logic: If new exp > old exp + 0.5 (tolerance), it's an update
+                    if new_exp_val > (old_exp_val + 0.5):
+                        status_to_save = "Re-Applicant (Updated)"
+                        print(f"  -> Existing candidate found. New exp ({new_exp_val}) > Old ({old_exp_val}). Updating.")
+                        update_count += 1
+                        
+                        # Update DB
+                        data['email'] = email
+                        data['experience'] = str(new_exp_val)
+                        data['name'] = data.get('Name')
+                        data['phone'] = data.get('Phone')
+                        data['resume_path'] = data.get('ResumePath')
+                        DB.upsert_candidate(data, is_update=True)
+                    else:
+                        status_to_save = "Duplicate (Ignored)"
+                        print(f"  -> Duplicate found (Exp {new_exp_val} vs {old_exp_val}). Marking as duplicate.")
+                        dupe_count += 1
+                else:
+                    # Insert New into DB
+                    data['email'] = email
+                    data['experience'] = str(new_exp_val)
+                    data['name'] = data.get('Name')
+                    data['phone'] = data.get('Phone')
+                    data['resume_path'] = data.get('ResumePath')
+                    DB.upsert_candidate(data, is_update=False)
+                    success_count += 1
+            else:
+                success_count += 1
             
-            # --- FIX: `append_row() missing 1...` ---
-            # The function signature was changed in excel_handler.py
-            new_sno = append_row(str(ACTIVE_EXCEL), data)
+            # 4. APPEND TO EXCEL
+            # We add all records to Excel so user can see duplicates if they want.
+            # Use status to filter them out later if needed.
+            new_sno = append_row(str(ACTIVE_EXCEL), data, status=status_to_save)
+            print(f"  -> Saved to Excel (S.No {new_sno})")
             
-            # --- FIX: Re-added the UI update logic ---
-            # Now that the watcher is gone, we add the row directly.
-            # This fixes the "not processing" bug.
+            # 5. UPDATE UI
             display_sno = len(tree.get_children()) + 1
             ui_call(
                 tree.insert,
                 "",
                 "end",
-                iid=new_sno, # Use real S.No. as the unique ID
+                iid=new_sno, 
                 values=(
                     display_sno,
                     data.get("Name", ""),
                     data.get("Email", ""),
                     data.get("Phone", ""),
-                    "" # Default empty status
+                    data.get("Experience", "0"),
+                    status_to_save
                 )
             )
-            # --- END FIX ---
-            
-            success_count += 1
-            
-            if check_duplicates:
-                for e in parsed_emails:
-                    existing_emails.add(e)
 
         except Exception as e:
-            log_error(f"Processing error for {fp}: {e}\n" + traceback.format_exc())
-            add_status(f"Error processing {fname}: {e}")
+            err_msg = f"Processing error for {fp}: {e}"
+            print(f"  -> EXCEPTION: {err_msg}")
+            log_error(err_msg + "\n" + traceback.format_exc())
             fail_count += 1
         finally:
             ui_call(progress.step, 1)
 
     ui_call(progress.config, value=0)
+    
     if stopped:
-        summary = f"Process stopped. Added: {success_count}, Failed: {fail_count}, Skipped: {skip_count}."
+        summary = "Parsing stopped by user."
     else:
-        summary = f"Batch complete: {success_count} added, {fail_count} failed, {skip_count} skipped (duplicates)."
+        summary = (f"Batch Complete.\n"
+                   f"New: {success_count}\n"
+                   f"Updated (Re-applicants): {update_count}\n"
+                   f"Duplicates (Ignored): {dupe_count}\n"
+                   f"Failed: {fail_count}")
     
-    add_status(summary)
-    if not stopped: 
-        ui_call(messagebox.showinfo, "Batch Complete", 
-                            f"Processed {len(file_paths)} files.\n\n"
-                            f"Added: {success_count}\n"
-                            f"Failed: {fail_count}\n"
-                            f"Skipped (Duplicates): {skip_count}")
-    
+    add_status("Batch processing finished.")
+    ui_call(messagebox.showinfo, "Result", summary)
     ui_call(parsing_complete)
 
 
 def safe_copy_to_workspace(src_path: str):
-    """
-    Copies a file to the RESUMES_DIR, avoiding name collisions.
-    Returns the destination Path.
-    """
     src = Path(src_path)
     dst = RESUMES_DIR / src.name
     
@@ -636,17 +629,9 @@ def on_upload(upload_type: str):
         add_status("No files selected.")
         return
 
-    copied_files_to_process = []
-    try:
-        add_status(f"Copying {len(file_paths)} files to workspace...")
-        for fp in file_paths:
-            dst = safe_copy_to_workspace(fp)
-            copied_files_to_process.append(str(dst))
-    except Exception as e:
-        messagebox.showerror("File Copy Error", f"Failed to copy files to workspace: {e}")
-        return
-
-    check_dups = var_dup.get()
+    # --- CHANGED: Don't copy here. Pass raw paths to thread. ---
+    
+    check_db = var_dup.get()
     STOP_EVENT = threading.Event()
     
     btn_single.config(state="disabled")
@@ -656,21 +641,19 @@ def on_upload(upload_type: str):
     
     PARSING_THREAD = threading.Thread(
         target=process_files_sequential,
-        args=(copied_files_to_process, check_dups, STOP_EVENT),
+        args=(file_paths, check_db, STOP_EVENT), # Pass RAW paths
         daemon=True
     )
     PARSING_THREAD.start()
 
 def on_stop_parsing():
-    """Sets the stop event for the parsing thread."""
     global STOP_EVENT
     if STOP_EVENT:
-        add_status("Stopping... please wait for the current file to finish.")
+        add_status("Stopping... please wait for the current file.")
         STOP_EVENT.set()
         btn_stop.config(state="disabled") 
 
 def parsing_complete():
-    """Called by the worker thread on the UI thread to re-enable UI."""
     global PARSING_THREAD, STOP_EVENT
     PARSING_THREAD = None
     STOP_EVENT = None
@@ -683,12 +666,11 @@ def parsing_complete():
     btn_stop.config(state="normal")
 
 def export_sorted_files():
-    """Asks for a destination and exports files by status."""
     if PARSING_THREAD and PARSING_THREAD.is_alive():
-        messagebox.showwarning("Busy", "Please wait for the parsing job to finish before exporting.")
+        messagebox.showwarning("Busy", "Please wait for parsing to finish.")
         return
         
-    destination_folder = filedialog.askdirectory(title="Select Destination Folder for Exports")
+    destination_folder = filedialog.askdirectory(title="Select Destination for Exports")
     if not destination_folder:
         return
 
@@ -696,15 +678,13 @@ def export_sorted_files():
 
     def export_in_thread():
         try:
-            # --- UPDATED: To handle dynamic statuses ---
             created_files = export_by_status(str(ACTIVE_EXCEL), destination_folder)
             
             if not created_files:
-                ui_call(messagebox.showinfo, "Export Complete", "No candidates with a status were found to export.")
-                ui_call(add_status, "Export complete. No files to create.")
+                ui_call(messagebox.showinfo, "Export Complete", "No candidates with status found.")
+                ui_call(add_status, "Export complete. No files created.")
                 return
 
-            # Create a summary message of all files created
             files_list_str = "\n".join(f"- {Path(f).name}" for f in created_files)
             
             ui_call(add_status, "Export complete!")
@@ -718,31 +698,18 @@ def export_sorted_files():
 
     threading.Thread(target=export_in_thread, daemon=True).start()
 
-# ----------------- REMOVED: File Watcher section -----------------
-# (ExcelEventHandler class, start_file_watcher function)
-
 def on_app_close():
-    """Handle cleanup on app exit."""
-    # --- SIMPLIFIED: No watcher to stop ---
-    print("Closing application.")
     root.destroy()
 
 # ----------------- Final initialization -----------------
-# Set initial button states
-btn_save_status.config(command=save_candidate_status)
-
 # Ensure the active excel exists and load data
 try:
     set_active_excel(ACTIVE_EXCEL) 
 except Exception as e:
-    log_error(f"Fatal error on startup trying to access Excel: {e}")
-    messagebox.showerror("Fatal Error", f"Could not create or read active Excel file:\n{ACTIVE_EXCEL}\n\nError: {e}\n\nThe application may not function correctly.")
+    log_error(f"Fatal startup error: {e}")
+    messagebox.showerror("Fatal Error", f"Could not access Excel:\n{e}")
 
-# --- REMOVED: start_file_watcher(ACTIVE_EXCEL) ---
-
-# --- NEW: Handle app close gracefully ---
 root.protocol("WM_DELETE_WINDOW", on_app_close)
-
 add_status(f"Ready. Workspace: {WORKSPACE}")
 
 # Start GUI
