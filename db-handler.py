@@ -34,7 +34,8 @@ class CandidateDB:
             log_error(f"Database Initialization Error: {e}")
 
     def get_candidate(self, email: str):
-        """Fetch a candidate by email."""
+        """Fetch a candidate by email (Unique)."""
+        if not email: return None
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -43,19 +44,38 @@ class CandidateDB:
             conn.close()
             
             if row:
-                return {
-                    "email": row[0],
-                    "name": row[1],
-                    "phone": row[2],
-                    "experience": row[3],
-                    "last_applied_date": row[4],
-                    "resume_path": row[5],
-                    "application_count": row[6]
-                }
+                return self._row_to_dict(row)
             return None
         except Exception as e:
             log_error(f"DB Fetch Error: {e}")
             return None
+
+    def get_candidates_by_name(self, name: str):
+        """Fetch candidates by Name (Non-Unique). Returns a list."""
+        if not name: return []
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            # Case-insensitive search
+            cursor.execute("SELECT * FROM candidates WHERE lower(name) = ?", (name.lower(),))
+            rows = cursor.fetchall()
+            conn.close()
+            
+            return [self._row_to_dict(r) for r in rows]
+        except Exception as e:
+            log_error(f"DB Fetch By Name Error: {e}")
+            return []
+
+    def _row_to_dict(self, row):
+        return {
+            "email": row[0],
+            "name": row[1],
+            "phone": row[2],
+            "experience": row[3],
+            "last_applied_date": row[4],
+            "resume_path": row[5],
+            "application_count": row[6]
+        }
 
     def upsert_candidate(self, data: dict, is_update: bool = False):
         """
